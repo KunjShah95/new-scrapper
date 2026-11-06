@@ -1,0 +1,108 @@
+{
+  "generated_at": "05-11-2026 12:38",
+  "total": 7398,
+  "withCoordinates": 7271,
+  "withBoundary": 7146,
+  "alterations": 298,
+  "withLocalReport": 2156,
+  "totalDeclaredCost": 2103006403670.0,
+  "districts": {
+    "ahmedabad": {
+      "label": "Ahmedabad",
+      "code": "AHME",
+      "total": 5515,
+      "withCoordinates": 5406,
+      "withBoundary": 5302,
+      "upcoming": 0,
+      "underConstruction": 2123,
+      "pastDue": 3374,
+      "completed": 18,
+      "unknown": 0,
+      "withLocalReport": 1528,
+      "centre": [
+        23.03205,
+        72.57283
+      ]
+    },
+    "gandhinagar": {
+      "label": "Gandhinagar",
+      "code": "GANDHI",
+      "total": 1680,
+      "withCoordinates": 1663,
+      "withBoundary": 1646,
+      "upcoming": 0,
+      "underConstruction": 792,
+      "pastDue": 884,
+      "completed": 4,
+      "unknown": 0,
+      "withLocalReport": 571,
+      "centre": [
+        23.1818,
+        72.61871
+      ]
+    },
+    "mehsana": {
+      "label": "Mehsana",
+      "code": "MEHS",
+      "total": 203,
+      "withCoordinates": 202,
+      "withBoundary": 198,
+      "upcoming": 0,
+      "underConstruction": 103,
+      "pastDue": 100,
+      "completed": 0,
+      "unknown": 0,
+      "withLocalReport": 57,
+      "centre": [
+        23.44982,
+        72.38627
+      ]
+    }
+  },
+  "types": [
+    {
+      "value": "Mixed Development",
+      "count": 3111
+    },
+    {
+      "value": "Residential/Group Housing",
+      "count": 3096
+    },
+    {
+      "value": "Commercial",
+      "count": 1070
+    },
+    {
+      "value": "Plotted Development",
+      "count": 121
+    }
+  ],
+  "stages": [
+    {
+      "value": "past-due",
+      "count": 4358
+    },
+    {
+      "value": "under-construction",
+      "count": 3018
+    },
+    {
+      "value": "completed",
+      "count": 22
+    }
+  ],
+  "discoverySources": [
+    {
+      "value": "regNo prefix",
+      "count": 7370
+    },
+    {
+      "value": "keyword sweep",
+      "count": 28
+    }
+  ],
+  "coordinateWarnings": 33,
+  "boundaryWarnings": 15,
+  "sample": false,
+  "datasetPath": "C:/ideabot internships/new scrapper/output/geo/schemes.json"
+}

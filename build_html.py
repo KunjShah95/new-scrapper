@@ -22,8 +22,28 @@ SITE = REPO / "docs"
 INDEX = OUTPUT / "index.json"
 MASTER_MD = OUTPUT / "AHMEDABAD_10_PROJECTS_REPORT.md"
 ZIP_SRC = OUTPUT / "18991_MARUTI_360.zip"
+GEO_SUMMARY = OUTPUT / "geo" / "summary.json"
 
 GENERATED_AT = datetime.now(timezone.utc).strftime("%d-%m-%Y %H:%M")
+
+
+def geo_totals():
+    """Scheme counts from the location harvest, if it has been run."""
+    if not GEO_SUMMARY.exists():
+        return None
+    try:
+        summary = json.loads(GEO_SUMMARY.read_text(encoding="utf-8"))
+    except ValueError:
+        return None
+    return {
+        "total": summary.get("total") or 0,
+        "mapped": summary.get("withCoordinates") or 0,
+        "boundary": summary.get("withBoundary") or 0,
+        "generated_at": summary.get("generated_at"),
+        "labels": " · ".join(info.get("label", key.title())
+                             for key, info in (summary.get("districts") or {}).items()),
+        "districts": summary.get("districts") or {},
+    }
 
 
 def inr(value):
@@ -177,6 +197,12 @@ TEMPLATE = """
   .kicker { font-size: 12px; opacity: .75; }
   .breadcrumb { font-size: 13px; color: var(--muted); margin: 18px 0 8px; }
   .breadcrumb a { color: var(--brand); text-decoration: none; }
+  .topbar nav { display: flex; gap: 8px; }
+  .topbar nav a {
+    color: #fff; text-decoration: none; font-size: 12.5px; font-weight: 600;
+    border: 1px solid rgba(255,255,255,.28); border-radius: 999px; padding: 5px 11px;
+  }
+  .topbar nav a:hover { background: rgba(255,255,255,.12); }
   .hero { padding: 28px 0 10px; }
   .hero h1 { margin: 0 0 6px; font-size: 30px; letter-spacing: -.3px; }
   .hero .lead { margin: 0; color: var(--muted); }
@@ -190,6 +216,7 @@ TEMPLATE = """
   <header class="topbar">
     <div class="wrap">
       <a class="brand" href="../index.html">GujRERA Ahmedabad — Project Reports</a>
+      <nav><a href="../map.html">Scheme map</a></nav>
       <span class="kicker">Generated {{ generated_at }}</span>
     </div>
   </header>
@@ -290,10 +317,24 @@ LANDING = """
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--ink); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; line-height: 1.6; }
   .wrap { max-width: 1160px; margin: 0 auto; padding: 0 20px; }
+  .topbar { color: #fff; padding: 12px 0; }
+  .topbar .wrap { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+  .topbar .brand { color: #fff; font-weight: 700; font-size: 15px; text-decoration: none; letter-spacing: .2px; }
+  .topbar .kicker { font-size: 12px; opacity: .78; }
   .hero { padding: 40px 0 26px; }
   .hero h1 { margin: 0 0 8px; font-size: 32px; letter-spacing: -.4px; }
   .hero .sub { color: var(--muted); margin: 0 0 14px; }
   .hero .meta { font-size: 13px; color: var(--muted); }
+  .cta { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+  .cta a {
+    display: inline-flex; align-items: center; gap: 8px; text-decoration: none; font-weight: 650;
+    font-size: 14px; padding: 11px 18px; border-radius: 9px;
+    background: var(--brand); color: #fff; box-shadow: var(--shadow);
+  }
+  .cta a:hover { background: var(--brand-dark); }
+  .cta a.ghost { background: #fff; color: var(--brand); border: 1px solid var(--line); }
+  .cta a.ghost:hover { background: #f1efeb; }
+  .mapnote { font-size: 12.5px; color: var(--muted); margin-top: 9px; }
   .search { display: flex; gap: 10px; max-width: 640px; margin: 14px auto 0; }
   .search input { flex: 1; padding: 12px 16px; border-radius: 8px; border: 1px solid var(--line); font-size: 15px; background: #fff; }
   .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 18px; padding: 8px 0 20px; }
@@ -305,7 +346,7 @@ LANDING = """
   .card .row:first-of-type { border-top: none; }
   .card .row .num { font-weight: 600; text-align: right; }
   .card .linkrow { display: flex; gap: 10px; margin-top: 14px; }
-  .card .linkrow a { color: var(--brand); font-size: 14px; font-weight: 600; }
+  .card .linkrow span { color: var(--brand); font-size: 14px; font-weight: 600; }
   .footer { margin-top: 26px; padding: 20px 0 30px; color: var(--muted); font-size: 13px; border-top: 1px solid var(--line); }
   .footer .wrap { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
   .host-note { background: #eef3f5; border-radius: 8px; padding: 12px 16px; margin-top: 12px; }
@@ -326,6 +367,18 @@ LANDING = """
       <h1>GujRERA — Ahmedabad City Project Reports</h1>
       <p class="sub">Client-ready overview of every project scraped from the Gujarat RERA portal ({{ count }} projects).</p>
       <p class="meta">Source: <a href="https://gujrera.gujarat.gov.in/#/project-preview">gujrera.gujarat.gov.in</a> · Static site — no server required · Generated {{ generated_at }}</p>
+      {% if geo %}
+      <div class="cta">
+        <a href="map.html">Open the scheme map — {{ "{:,}".format(geo.total) }} schemes →</a>
+        <a class="ghost" href="downloads/schemes.csv">Download CSV</a>
+        <a class="ghost" href="downloads/boundaries.geojson">Download GeoJSON</a>
+      </div>
+      <p class="mapnote">
+        Every registered scheme in {{ geo.labels }} plotted with its exact boundary —
+        {{ "{:,}".format(geo.mapped) }} geocoded,
+        {{ "{:,}".format(geo.boundary) }} with the promoter's plotted polygon.
+      </p>
+      {% endif %}
     </section>
 
     <div class="search">
@@ -342,10 +395,7 @@ LANDING = """
         <div class="row"><span>Total cost</span><span class="num">₹ {{ cost_str(p.cost) }}</span></div>
         <div class="row"><span>Units / Booked / Un-booked</span><span class="num">{{ p.units }} / {{ p.booked }} / {{ p.unbooked }}</span></div>
         <div class="row"><span>Documents ok</span><span class="num">{{ p.docs_ok }}</span></div>
-        <div class="linkrow">
-          <a href="{{ p.folder }}/index.html">Report →</a>
-          <a href="https://gujrera.gujarat.gov.in/#/project-preview" target="_blank" rel="noopener">Portal ↗</a>
-        </div>
+        <div class="linkrow"><span>Report →</span></div>
       </a>
       {% endfor %}
     </div>
@@ -355,6 +405,7 @@ LANDING = """
         <div>
           Master report (all 10 projects in one document):
           <a href="report.html">report.html</a>
+          {% if geo %}· <a href="map.html">Scheme map ({{ "{:,}".format(geo.total) }} schemes)</a>{% endif %}
         </div>
         <div class="host-note">
           <b>To host on GitHub Pages:</b> push this repo to GitHub and enable Pages → publish from the <code>/docs</code> folder (main branch).
@@ -418,7 +469,8 @@ def render_landing(projects):
     cards = []
     for p in projects:
         cards.append({**p, "cost": p["cost"]})
-    return Template(LANDING).render(count=len(projects), projects=cards, generated_at=GENERATED_AT, cost_str=cost_str)
+    return Template(LANDING).render(count=len(projects), projects=cards, geo=geo_totals(),
+                                   generated_at=GENERATED_AT, cost_str=cost_str)
 
 
 def cost_str(value):
