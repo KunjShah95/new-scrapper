@@ -1,0 +1,14 @@
+{
+  "name": "gujrera-docs-worker",
+  "private": true,
+  "description": "Serves the GujRERA scraped document archive from Cloudflare R2",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "dry-run": "wrangler deploy --dry-run"
+  },
+  "devDependencies": {
+    "wrangler": "^4.157.0"
+  }
+}

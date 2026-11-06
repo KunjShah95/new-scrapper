@@ -1,0 +1,19 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "gujrera-docs",
+  "main": "src/index.js",
+  "compatibility_date": "2026-11-05",
+
+  // The bucket mirrored by ../r2_sync.py and written to by gujrera/sink.py.
+  // Change in cloudflare/.env (R2_BUCKET) as well.
+  "r2_buckets": [
+    {
+      "binding": "BUCKET",
+      "bucket_name": "lrms-legal-pdfs"
+    }
+  ],
+
+  "observability": {
+    "enabled": true
+  }
+}

@@ -1,0 +1,3 @@
+# Extra dependencies for the Cloudflare side only.
+# The scraper itself needs just requirements.txt.
+boto3>=1.34.0
