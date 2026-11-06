@@ -29,6 +29,7 @@ from gujrera.geo import DEFAULT_DISTRICTS as GEO_DISTRICTS
 from gujrera.geo import run_geo
 from gujrera.legacy import import_legacy
 from gujrera.mirror import sync_mirror
+from gujrera.output_sync import sync_output
 from gujrera.pipeline import discover_projects, resolve_target, run, run_districts, scrape_project
 from gujrera.report import build_master_markdown, build_project_markdown
 from gujrera.runlock import LockHeld, RunLock, holder_info
@@ -262,19 +263,39 @@ def cmd_import_legacy(state_path: Path, output_root: Path, dry_run: bool) -> Non
     print()
 
 
-def cmd_sync_mirror(sink: Sink, root: Path, dry_run: bool) -> None:
-    """Republish local delta artifacts in the current sink."""
-    print(f"\nSyncing {root} -> {sink.name}\n")
+def cmd_sync_target(sink: Sink, root: Path, mode: str, dry_run: bool) -> None:
+    """Republish an on-disk tree in the current sink.
+
+    mode 'mirror'  — r2_mirror/ artifacts a local run wrote (layers on
+                     `--sync-mirror` semantics),
+    mode 'output'  — the per-project estate in output/ parsed the way
+                     r2_sync.py would key it, minus what the bucket already
+                     has, which is what the live direct-to-R2 pipeline skips.
+    """
+    label = "r2_mirror" if mode == "mirror" else "output"
+    print(f"\nSyncing {root} ({mode}) -> {sink.name}\n")
+
     if dry_run:
-        totals = sync_mirror(sink, root, dry_run=True)
+        totals = (sync_mirror(sink, root, dry_run=True) if mode == "mirror"
+                  else sync_output(sink, root, dry_run=True))
     else:
-        with RunLock(root.parent / "state" / "run.lock", purpose="sync-mirror"):
-            totals = sync_mirror(sink, root, dry_run=False)
+        with RunLock(root.parent / "state" / "run.lock", purpose=f"sync-{mode}"):
+            totals = (sync_mirror(sink, root, dry_run=False) if mode == "mirror"
+                      else sync_output(sink, root, dry_run=False))
 
     verb = "would push" if dry_run else "pushed"
     print(f"  files found        : {totals['found']:,}"
           f"  ({totals['bytes'] / 1e9:.2f} GB)")
     print(f"  {verb:<19}: {totals['pushed']:,}")
+    if totals.get("failed"):
+        print(f"  failed             : {totals['failed']:,} (repeat the command; "
+              "resumable by key)")
+    if mode == "output":
+        fresh = totals.get("fresh", 0)
+        if fresh:
+            print(f"  (skipped as too-fresh: {fresh:,} — another scrape may be writing them)")
+        for kind, size in sorted((totals.get("by") or {}).items()):
+            print(f"    {kind:<8} {size['n']:>8,} ({size['bytes'] / 1e9:.2f} GB)")
     print(f"  already in the sink: {totals['skipped']:,}")
     print()
 
@@ -527,6 +548,9 @@ def main() -> None:
     parser.add_argument("--sync-mirror", action="store_true",
                          help="publish r2_mirror/ artifacts through the current sink "
                               "(dry-run with --dry-run)")
+    parser.add_argument("--sync-output", action="store_true",
+                         help="publish the per-project records and files in output/ that "
+                              "the bucket is missing (skips what is already there)")
     parser.add_argument("--proxy", default=None, metavar="URL",
                          help="egress proxy, e.g. http://user:pass@host:port "
                               "(overrides GUJRERA_PROXY / PROXY_* in .env)")
@@ -596,8 +620,11 @@ def main() -> None:
     elif args.import_legacy:
         cmd_import_legacy(args.state, OUTPUT, args.dry_run)
     elif args.sync_mirror:
-        cmd_sync_mirror(make_sink(args.sink, root=args.sink_root, public_base=args.public_base),
-                        args.sink_root, args.dry_run)
+        cmd_sync_target(make_sink(args.sink, root=args.sink_root, public_base=args.public_base),
+                        args.sink_root, "mirror", args.dry_run)
+    elif args.sync_output:
+        cmd_sync_target(make_sink(args.sink, root=args.sink_root, public_base=args.public_base),
+                        OUTPUT, "output", args.dry_run)
     elif args.daily or args.backfill:
         cmd_daily(args, districts or list(DELTA_DISTRICTS))
     elif args.geo:
