@@ -1,0 +1,14 @@
+[Unit]
+Description=Run a GujRERA backfill slice every 20 minutes
+
+[Timer]
+# TEMPORARY. Enable this only while the first crawl is catching up, then:
+#   systemctl disable --now gujrera-backfill.timer
+# A drained backlog makes each slice a ~20 second no-op, but the weekly timer is
+# the one that should own the schedule once the data is in.
+OnCalendar=*:0/20
+AccuracySec=1min
+Unit=gujrera-backfill.service
+
+[Install]
+WantedBy=timers.target

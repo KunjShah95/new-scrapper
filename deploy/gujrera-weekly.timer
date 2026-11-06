@@ -1,0 +1,15 @@
+[Unit]
+Description=Run the GujRERA scrape once a week
+
+[Timer]
+# Monday 02:30. Persistent=true is the important half: if the VPS was down at
+# 02:30, systemd runs the missed job shortly after boot instead of skipping a
+# week silently.
+OnCalendar=Mon *-*-* 02:30:00
+Persistent=true
+RandomizedDelaySec=600
+AccuracySec=1min
+Unit=gujrera-weekly.service
+
+[Install]
+WantedBy=timers.target

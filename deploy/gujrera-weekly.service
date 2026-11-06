@@ -1,0 +1,37 @@
+[Unit]
+Description=GujRERA weekly scrape (discover new projects, re-verify every endpoint)
+Documentation=https://gujrera.gujarat.gov.in
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=@@APP_USER@@
+Group=@@APP_USER@@
+WorkingDirectory=@@APP_DIR@@
+EnvironmentFile=@@APP_DIR@@/.env
+Environment=PYTHONIOENCODING=utf-8
+Environment=PYTHONUNBUFFERED=1
+
+# One weekly pass does the whole job. --reverify walks every endpoint of every
+# project (not just the 6-endpoint daily probe), discovers newly registered
+# projects along the way, and downloads only document UIDs never seen before —
+# everything already held is reused by UID, so a full pass costs zero bytes.
+#
+# --max-scrapes is a runaway guard, not a budget: it sits above the current
+# estate (~2,156) so a normal week covers everything.
+ExecStart=@@APP_DIR@@/.venv/bin/python run.py --daily --reverify --max-scrapes 5000 --prune-uploaded
+TimeoutStartSec=12h
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+
+# The sink is off-site, so local files are only ever a staging area.
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=@@APP_DIR@@
+
+[Install]
+WantedBy=multi-user.target

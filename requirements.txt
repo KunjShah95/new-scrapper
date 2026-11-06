@@ -1,1 +1,7 @@
 requests>=2.31.0
+
+# Only needed for the R2 sink; the local sink works without it.
+boto3>=1.34.0
+
+# Only needed if you point PROXY_SCHEME at socks5/socks5h.
+PySocks>=1.7.1

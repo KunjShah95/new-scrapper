@@ -1,0 +1,28 @@
+[Unit]
+Description=GujRERA backfill slice (drains the never-captured backlog)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=@@APP_USER@@
+Group=@@APP_USER@@
+WorkingDirectory=@@APP_DIR@@
+EnvironmentFile=@@APP_DIR@@/.env
+Environment=PYTHONIOENCODING=utf-8
+Environment=PYTHONUNBUFFERED=1
+
+# Backfill skips the probe entirely and only touches projects that have never
+# been captured, so it needs no change detection and no discovery each slice.
+ExecStart=@@APP_DIR@@/.venv/bin/python run.py --daily --backfill --max-scrapes 250 --prune-uploaded
+TimeoutStartSec=8h
+Nice=10
+
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=@@APP_DIR@@
+
+[Install]
+WantedBy=multi-user.target

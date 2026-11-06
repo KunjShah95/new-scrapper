@@ -3,3 +3,18 @@ __pycache__/
 _work/
 output/
 .env
+
+# Daily state: the SQLite journal is the system of record, so it is backed up
+# rather than committed.
+state/
+r2_mirror/
+
+# Cloudflare deployment
+_deploy/
+cloudflare/r2_state.json
+cloudflare/r2_state.json.tmp
+cloudflare/.env
+cloudflare/*.log
+cloudflare/worker/node_modules/
+node_modules/
+.wrangler/

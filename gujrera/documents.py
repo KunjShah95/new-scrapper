@@ -12,11 +12,16 @@ fields added by GujRERA are picked up automatically.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from . import r2_direct
 
 log = logging.getLogger("gujrera.docs")
 
@@ -221,33 +226,29 @@ def extension_for(content_type: str, filename: str) -> str:
     return mapping.get((content_type or "").split(";")[0].strip().lower(), "bin")
 
 
-def download_all(
-    client,
-    uid_pairs: Iterable[Tuple[str, str]],
-    out_dir: Path,
-    skip_existing: bool = True,
-) -> List[Dict[str, Any]]:
-    """Download every unique UID once. Returns the manifest rows."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    manifest: List[Dict[str, Any]] = []
-    seen = label_index(uid_pairs)
-
-    total = len(seen)
-    for index, (uid, label) in enumerate(seen.items(), start=1):
-        row: Dict[str, Any] = {
-            "label": label,
-            "uid": uid,
-            "url": client.url("download", uid=uid),
-            "file": "",
-            "bytes": 0,
-            "content_type": "",
-            "status": "",
-        }
-        try:
-            content, content_type, raw_name = client.get_document(uid)
-            ext = extension_for(content_type, raw_name)
-            nice = safe_name(raw_name.rsplit(".", 1)[0]) if raw_name else safe_name(label)
-            filename = f"{nice}.{ext}"
+def _download_one(client, out_dir: Path, skip_existing: bool, lock: threading.Lock,
+                   uid: str, label: str) -> Dict[str, Any]:
+    row: Dict[str, Any] = {
+        "label": label,
+        "uid": uid,
+        "url": client.url("download", uid=uid),
+        "file": "",
+        "bytes": 0,
+        "sha256": "",
+        "content_type": "",
+        "status": "",
+    }
+    try:
+        content, content_type, raw_name = client.get_document(uid)
+        if not content:
+            # The portal answers HTTP 200 with an empty body for some UIDs.
+            # Writing that as a 0-byte "ok" file hides a missing document, so
+            # record it as a failure instead and let the next run retry it.
+            raise ValueError("empty response (0 bytes)")
+        ext = extension_for(content_type, raw_name)
+        nice = safe_name(raw_name.rsplit(".", 1)[0]) if raw_name else safe_name(label)
+        filename = f"{nice}.{ext}"
+        with lock:  # filesystem collision check must be atomic across worker threads
             target = out_dir / filename
             counter = 1
             while target.exists() and target.stat().st_size != len(content):
@@ -255,17 +256,98 @@ def download_all(
                 counter += 1
             if not (skip_existing and target.exists()):
                 target.write_bytes(content)
-            row.update(
-                file=str(target.name),
-                bytes=len(content),
-                content_type=content_type.split(";")[0],
-                status="ok",
-            )
-            log.info("[%d/%d] %-45s -> %s (%d KB)", index, total, label[:45], target.name, len(content) // 1024)
-        except Exception as exc:  # noqa: BLE001 - a dead link must not kill the run
-            row["status"] = f"failed: {exc}"
-            log.warning("[%d/%d] %-45s -> FAILED (%s)", index, total, label[:45], exc)
-        manifest.append(row)
+                # With direct-to-R2 on, the document is sent to the bucket now and
+                # removed from disk, so a long crawl never fills the laptop.
+                r2_key = r2_direct.offload(target)
+                if r2_key:
+                    row["r2_key"] = r2_key
+                    row["storage"] = "r2"
+        row.update(
+            file=str(target.name),
+            bytes=len(content),
+            sha256=hashlib.sha256(content).hexdigest(),
+            content_type=content_type.split(";")[0],
+            status="ok",
+        )
+    except Exception as exc:  # noqa: BLE001 - a dead link must not kill the run
+        row["status"] = f"failed: {exc}"
+    return row
+
+
+def _reuse_row(uid: str, label: str, known: Dict[str, Any], client) -> Dict[str, Any]:
+    """Build a manifest row from state without touching the network.
+
+    A UID is GujRERA's upload identity, so a UID we have already downloaded and
+    uploaded cannot have changed. This is what turns a full re-download into a
+    no-op for the ~98% of documents that are stable day to day.
+    """
+    return {
+        "label": label,
+        "uid": uid,
+        "url": client.url("download", uid=uid),
+        "file": known.get("file_name") or "",
+        "bytes": known.get("bytes") or 0,
+        "sha256": known.get("sha256") or "",
+        "content_type": known.get("content_type") or "",
+        "blob_key": known.get("blob_key") or "",
+        "status": "ok",
+        "reused": True,
+    }
+
+
+def download_all(
+    client,
+    uid_pairs: Iterable[Tuple[str, str]],
+    out_dir: Path,
+    skip_existing: bool = True,
+    max_workers: int = 8,
+    known: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """Download every unique UID, in parallel. Returns the manifest rows.
+
+    `known` maps uid -> a previously recorded document row. Any UID present with
+    a successful status and a sha256 is reused as-is: no request, no bytes.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    seen = label_index(uid_pairs)
+    total = len(seen)
+    if not total:
+        return []
+
+    known = known or {}
+    lock = threading.Lock()
+    manifest: List[Dict[str, Any]] = []
+
+    to_fetch: Dict[str, str] = {}
+    for uid, label in seen.items():
+        prior = known.get(uid)
+        if prior and prior.get("status") == "ok" and prior.get("sha256") and prior.get("blob_key"):
+            manifest.append(_reuse_row(uid, label, prior, client))
+        else:
+            to_fetch[uid] = label
+
+    reused = len(manifest)
+    pending = len(to_fetch)
+    if reused:
+        log.info("reusing %d already-captured documents, %d to fetch", reused, pending)
+
+    if not pending:
+        return manifest
+
+    with ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
+        futures = {
+            pool.submit(_download_one, client, out_dir, skip_existing, lock, uid, label): label
+            for uid, label in to_fetch.items()
+        }
+        for index, future in enumerate(as_completed(futures), start=1):
+            label = futures[future]
+            row = future.result()
+            manifest.append(row)
+            if row["status"] == "ok":
+                log.info("[%d/%d] %-45s -> %s (%d KB)", index, pending, label[:45],
+                         row["file"], row["bytes"] // 1024)
+            else:
+                log.warning("[%d/%d] %-45s -> FAILED (%s)", index, pending, label[:45], row["status"])
     return manifest
 
 
