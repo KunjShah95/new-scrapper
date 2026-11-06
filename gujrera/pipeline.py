@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .api import GujreraClient, payload
-from .documents import download_all, harvest, is_uid, write_manifest
+from .documents import download_all, harvest, harvest_scanned, is_uid, write_manifest
 from .report import (
     build_master_markdown,
     build_project_markdown,
@@ -287,6 +287,8 @@ def scrape_project(client: GujreraClient, target: Dict[str, Any], output_root: P
 
     # ------------------------------------------------------------------ document index ---
     uid_pairs = harvest(raw)
+    # Pre-2019 registrations keep their filings as scanned pages, not UIDs.
+    uid_pairs.extend(harvest_scanned(raw.get("scanned_docs")))
     # Explicit extras: Form 5 PDF links and progress photographs are plain lists.
     for record in payload(raw.get("annual_compliance")) or []:
         if isinstance(record, dict) and is_uid(record.get("pdfUid")):

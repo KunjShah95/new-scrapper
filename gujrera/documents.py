@@ -8,10 +8,17 @@ Instead of hard-coding the couple of hundred document fields the portal uses, we
 every JSON payload we downloaded and collect *any* value that looks like a VDMS UID,
 keeping the field name as a human readable label. That way nothing is missed and new
 fields added by GujRERA are picked up automatically.
+
+Pre-2019 registrations are different: their filings were scanned and are listed by
+the `scanned_docs` endpoint as `vdms/gujreraapi/getfile?RootFile=..&FileName=..`
+URLs, not UIDs. `harvest_scanned` turns those into `scan:<root>/<file>` references,
+which flow through download, manifest and state exactly like a UID does.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import logging
@@ -20,8 +27,10 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import parse_qs, urlsplit
 
 from . import r2_direct
+from .api import SCAN_PREFIX
 
 log = logging.getLogger("gujrera.docs")
 
@@ -157,6 +166,15 @@ def is_uid(value: Any) -> bool:
     return isinstance(value, str) and bool(_UID_RE.match(value.strip()))
 
 
+def is_scan_ref(value: Any) -> bool:
+    return isinstance(value, str) and value.startswith(SCAN_PREFIX) and "/" in value
+
+
+def is_doc_ref(value: Any) -> bool:
+    """A downloadable document reference: a VDMS UID or a `scan:` ref."""
+    return is_uid(value) or is_scan_ref(value)
+
+
 def prettify(key: str) -> str:
     if key in LABELS:
         return LABELS[key]
@@ -173,7 +191,7 @@ def label_index(pairs: Iterable[Tuple[str, str]]) -> Dict[str, str]:
     best: Dict[str, str] = {}
     for label, uid in pairs:
         uid = (uid or "").strip()
-        if not is_uid(uid):
+        if not is_doc_ref(uid):
             continue
         if len(label) > len(best.get(uid, "")):
             best[uid] = label
@@ -199,6 +217,45 @@ def harvest(obj: Any, prefix: str = "") -> List[Tuple[str, str]]:
             else:
                 found.extend(harvest(item, prefix))
     return found
+
+
+def _b64_param(query: Dict[str, List[str]], key: str) -> str:
+    value = (query.get(key) or [""])[0]
+    try:
+        return base64.b64decode(value, validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError):
+        return ""
+
+
+def harvest_scanned(response: Any) -> List[Tuple[str, str]]:
+    """(label, scan ref) pairs from a `scanned_docs` (GetACK) response."""
+    detail = (response or {}).get("ACKListDetail") if isinstance(response, dict) else None
+    pages = (detail or {}).get("typeFileNamedetail") or []
+    found: List[Tuple[str, str]] = []
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        query = parse_qs(urlsplit(str(page.get("docName") or "")).query)
+        root, name = _b64_param(query, "RootFile"), _b64_param(query, "FileName")
+        if not (root and name) or "/" in root:
+            continue
+        title = str(page.get("pageTypeName") or "").strip() or f"Page {page.get('pageTypeId')}"
+        found.append((f"Scanned Filing — {title}", f"{SCAN_PREFIX}{root}/{name}"))
+    return found
+
+
+def harvest_raw_dir(raw_dir: Path) -> List[Tuple[str, str]]:
+    """Every (label, ref) the cached payloads in a project's `raw/` reference."""
+    pairs: List[Tuple[str, str]] = []
+    for path in raw_dir.glob("*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            continue
+        pairs.extend(harvest(data))
+        if path.stem == "scanned_docs":
+            pairs.extend(harvest_scanned(data))
+    return pairs
 
 
 def safe_name(text: str, max_len: int = 90) -> str:
@@ -231,7 +288,7 @@ def _download_one(client, out_dir: Path, skip_existing: bool, lock: threading.Lo
     row: Dict[str, Any] = {
         "label": label,
         "uid": uid,
-        "url": client.url("download", uid=uid),
+        "url": client.document_url(uid),
         "file": "",
         "bytes": 0,
         "sha256": "",
@@ -286,7 +343,7 @@ def _reuse_row(uid: str, label: str, known: Dict[str, Any], client) -> Dict[str,
     return {
         "label": label,
         "uid": uid,
-        "url": client.url("download", uid=uid),
+        "url": client.document_url(uid),
         "file": known.get("file_name") or "",
         "bytes": known.get("bytes") or 0,
         "sha256": known.get("sha256") or "",

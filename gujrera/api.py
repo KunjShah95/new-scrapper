@@ -19,6 +19,7 @@ says so once, instead of failing every request.
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import time
@@ -70,7 +71,14 @@ ENDPOINTS: Dict[str, str] = {
     # ---- Documents -------------------------------------------------------------------
     "scanned_docs": "vdms/gujreraapi/api/GetACK?AckNo={ack_no}",
     "download": "vdms/download/{uid}",
+    # Pre-2019 registrations: scanned filings listed by `scanned_docs`.
+    "scanned_file": "vdms/gujreraapi/getfile?RootFile={root_file}&FileName={file_name}",
 }
+
+# Prefix marking a document reference that is a scanned filing, not a VDMS UID.
+# The rest is "<RootFile>/<FileName>", both base64-decoded, e.g.
+# "scan:RAA00727151117/RAA00727151117_1.pdf".
+SCAN_PREFIX = "scan:"
 
 
 def _env_float(name: str, default: float) -> float:
@@ -167,6 +175,20 @@ class GujreraClient:
         adapter = HTTPAdapter(max_retries=retry, pool_connections=pool_maxsize, pool_maxsize=pool_maxsize)
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
+        # Scanned filings answer HTTP 500 "(No such file or directory)" when the
+        # portal lists a page it no longer holds. That is permanent, so 500 is not
+        # auto-retried here; get_document reads the body and decides.
+        scan_retry = Retry(
+            total=retries,
+            backoff_factor=1.5,
+            status_forcelist=(429, 502, 503, 504),
+            allowed_methods=frozenset({"GET"}),
+            other=0,
+        )
+        self.session.mount(
+            BASE_URL + ENDPOINTS["scanned_file"].split("?", 1)[0],
+            HTTPAdapter(max_retries=scan_retry, pool_connections=pool_maxsize, pool_maxsize=pool_maxsize),
+        )
         if self.proxy:
             self.session.proxies.update({"http": self.proxy, "https": self.proxy})
             log.info("egress proxy: %s", mask_proxy(self.proxy))
@@ -245,15 +267,36 @@ class GujreraClient:
         log.warning("Giving up on %s (%s)", url, last_err)
         return None, last_err
 
+    def document_url(self, ref: str) -> str:
+        """Public URL for a document reference: a VDMS UID or a `scan:` ref."""
+        if ref.startswith(SCAN_PREFIX):
+            root, _, name = ref[len(SCAN_PREFIX):].partition("/")
+            return self.url(
+                "scanned_file",
+                root_file=base64.b64encode(root.encode("utf-8")).decode("ascii"),
+                file_name=base64.b64encode(name.encode("utf-8")).decode("ascii"),
+            )
+        return self.url("download", uid=ref)
+
     def get_document(self, uid: str) -> Tuple[Optional[bytes], str, str]:
-        """Download a document by its VDMS UID. Returns (bytes, content_type, filename)."""
-        url = self.url("download", uid=uid)
-        try:
-            resp = self.session.get(url, timeout=self.timeout, allow_redirects=True)
-        except requests.exceptions.ProxyError as exc:
-            self.disable_proxy(self._proxy_error_reason(exc))
-            resp = self.session.get(url, timeout=self.timeout, allow_redirects=True)
-        time.sleep(self.delay)
+        """Download a document by its VDMS UID or `scan:` ref.
+
+        Returns (bytes, content_type, filename).
+        """
+        url = self.document_url(uid)
+        attempts = 2 if uid.startswith(SCAN_PREFIX) else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                resp = self.session.get(url, timeout=self.timeout, allow_redirects=True)
+            except requests.exceptions.ProxyError as exc:
+                self.disable_proxy(self._proxy_error_reason(exc))
+                resp = self.session.get(url, timeout=self.timeout, allow_redirects=True)
+            time.sleep(self.delay)
+            if resp.status_code == 500 and "No such file or directory" in resp.text[:500]:
+                raise RuntimeError("missing on portal (HTTP 500: No such file or directory)")
+            if resp.status_code == 200 or attempt == attempts:
+                break
+            time.sleep(1.5 * attempt)
         if resp.status_code != 200:
             raise RuntimeError(f"HTTP {resp.status_code}")
         filename = ""
