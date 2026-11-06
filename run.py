@@ -28,11 +28,12 @@ from gujrera.delta import run_delta
 from gujrera.geo import DEFAULT_DISTRICTS as GEO_DISTRICTS
 from gujrera.geo import run_geo
 from gujrera.legacy import import_legacy
+from gujrera.mirror import sync_mirror
 from gujrera.pipeline import discover_projects, resolve_target, run, run_districts, scrape_project
 from gujrera.report import build_master_markdown, build_project_markdown
 from gujrera.runlock import LockHeld, RunLock, holder_info
 from gujrera.scheduler import DEFAULT_DISTRICT_ORDER, Scheduler
-from gujrera.sink import make_sink
+from gujrera.sink import Sink, make_sink
 from gujrera.state import State
 
 ROOT = Path(__file__).resolve().parent
@@ -258,6 +259,23 @@ def cmd_import_legacy(state_path: Path, output_root: Path, dry_run: bool) -> Non
         print(f"\nAfter import")
         for row in cov["districts"]:
             print(f"  {row['district']:<14} {row['captured']:>6,} of {row['active']:>6,} captured")
+    print()
+
+
+def cmd_sync_mirror(sink: Sink, root: Path, dry_run: bool) -> None:
+    """Republish local delta artifacts in the current sink."""
+    print(f"\nSyncing {root} -> {sink.name}\n")
+    if dry_run:
+        totals = sync_mirror(sink, root, dry_run=True)
+    else:
+        with RunLock(root.parent / "state" / "run.lock", purpose="sync-mirror"):
+            totals = sync_mirror(sink, root, dry_run=False)
+
+    verb = "would push" if dry_run else "pushed"
+    print(f"  files found        : {totals['found']:,}"
+          f"  ({totals['bytes'] / 1e9:.2f} GB)")
+    print(f"  {verb:<19}: {totals['pushed']:,}")
+    print(f"  already in the sink: {totals['skipped']:,}")
     print()
 
 
@@ -506,6 +524,9 @@ def main() -> None:
     parser.add_argument("--import-legacy", action="store_true",
                          help="fold projects already in output/ (scraped before the delta "
                               "engine existed) into the state store; no network")
+    parser.add_argument("--sync-mirror", action="store_true",
+                         help="publish r2_mirror/ artifacts through the current sink "
+                              "(dry-run with --dry-run)")
     parser.add_argument("--proxy", default=None, metavar="URL",
                          help="egress proxy, e.g. http://user:pass@host:port "
                               "(overrides GUJRERA_PROXY / PROXY_* in .env)")
@@ -574,6 +595,9 @@ def main() -> None:
         cmd_audit(args.state, args.audit)
     elif args.import_legacy:
         cmd_import_legacy(args.state, OUTPUT, args.dry_run)
+    elif args.sync_mirror:
+        cmd_sync_mirror(make_sink(args.sink, root=args.sink_root, public_base=args.public_base),
+                        args.sink_root, args.dry_run)
     elif args.daily or args.backfill:
         cmd_daily(args, districts or list(DELTA_DISTRICTS))
     elif args.geo:

@@ -407,9 +407,19 @@ class State:
         return [dict(r) for r in rows]
 
     def uploaded_shas(self) -> set:
-        """sha256 values already pushed to the current sink."""
+        """sha256 values already present under this sink's content-addressed layout.
+
+        Only `blobs/…` counts: rows imported from the legacy path-based layout
+        (`<prefix>/<project>/files/<file>`) hold valid R2 objects, but *not* at
+        the content-addressed key the delta engine derives from the hash. If
+        those shas were trusted here, a reused legacy row would be marked with
+        a `blobs/…` key that was never PUT — and the manifest would point at a
+        404 forever. Use `migrate` tooling to copy legacy objects into
+        `blobs/…`; until then such a row keeps its real, working key.
+        """
         return {r["sha256"] for r in self._query(
-            "SELECT DISTINCT sha256 FROM documents WHERE blob_key IS NOT NULL AND sha256 IS NOT NULL"
+            "SELECT DISTINCT sha256 FROM documents "
+            "WHERE blob_key LIKE 'blobs/%' AND sha256 IS NOT NULL"
         )}
 
     # ---------------------------------------------------------------------- runs ---

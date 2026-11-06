@@ -44,6 +44,7 @@ from .pipeline import BUNDLE_ENDPOINTS, district_codes, discover_projects, scrap
 from .report import build_master_markdown
 from .runlock import LockHeld, RunLock
 from .sink import IMMUTABLE, Sink, blob_key
+from .snapshot import publish_state_snapshot
 from .state import State, canonical_hash, today
 
 log = logging.getLogger("gujrera.delta")
@@ -281,7 +282,7 @@ class Uploader:
 
     def push(self, pid: int, bundle: Dict[str, Any], folder: Path,
              documents: Sequence[Dict[str, Any]]) -> Dict[str, int]:
-        stats = {"blobs_new": 0, "blobs_skipped": 0, "bytes": 0}
+        stats = {"blobs_new": 0, "blobs_skipped": 0, "blobs_kept_path": 0, "bytes": 0}
 
         raw_only = {k: v for k, v in (bundle.get("raw") or {}).items() if v is not None}
         self.sink.put_json_gz(f"projects/{pid}/raw.json.gz", raw_only)
@@ -292,26 +293,48 @@ class Uploader:
             self.sink.put_file(f"projects/{pid}/report.md", report, "text/markdown; charset=utf-8")
 
         for row in documents:
-            if row.get("status") != "ok" or not row.get("sha256"):
+            prior_key = row.get("blob_key") or ""
+            if row.get("status") != "ok":
                 continue
+            if not row.get("sha256"):
+                # A legacy row with no hash still holds real R2 bytes under the
+                # path-based key the importer derived. It cannot be moved into
+                # the content-addressed layout without the bytes, so the honest
+                # thing is to keep the key that actually works.
+                row["blob_key"] = prior_key
+                row["blob_url"] = self.sink.url_for(prior_key) if prior_key else None
+                continue
+
             sha = row["sha256"]
             key = blob_key(sha)
-            row["blob_key"] = key
-            row["blob_url"] = self.sink.url_for(key)
 
             if sha in self._uploaded:
+                row["blob_key"] = key
+                row["blob_url"] = self.sink.url_for(key)
                 stats["blobs_skipped"] += 1
                 continue
+
             local = folder / "files" / (row.get("file") or "")
-            if not local.exists():
-                log.warning("blob %s referenced but %s is missing locally", sha[:12], local)
+            if local.exists():
+                self.sink.put_file(key, local, row.get("content_type") or "application/octet-stream",
+                                   cache_control=IMMUTABLE)
+                self._uploaded.add(sha)
+                row["blob_key"] = key
+                row["blob_url"] = self.sink.url_for(key)
+                stats["blobs_new"] += 1
+                stats["bytes"] += int(row.get("bytes") or 0)
+            elif prior_key:
+                # Reused without a download, and the content-addressed blob
+                # does not exist yet. Nothing here has the bytes, but R2 does —
+                # under prior_key. Never overwrite a working key with one we
+                # have not created.
+                row["blob_key"] = prior_key
+                row["blob_url"] = self.sink.url_for(prior_key)
+                stats["blobs_kept_path"] += 1
+            else:
+                log.warning("blob %s referenced but %s is missing locally "
+                            "and no prior key is known", sha[:12], local)
                 row.pop("blob_key", None)
-                continue
-            self.sink.put_file(key, local, row.get("content_type") or "application/octet-stream",
-                               cache_control=IMMUTABLE)
-            self._uploaded.add(sha)
-            stats["blobs_new"] += 1
-            stats["bytes"] += int(row.get("bytes") or 0)
 
         # A --no-files run has no manifest; writing an empty one would erase the
         # document list already in the sink for this project.
@@ -800,6 +823,11 @@ def run_delta(output_root: Path, state_path: Path, sink: Sink,
             catalogued = write_catalogues(sink, state)
             log.info("catalogue: %d projects, %d documents", len(state.project_meta()),
                      catalogued)
+            # Last, so it captures the finished run itself. Costs nothing: the
+            # database is a few MB, and losing it loses every hash, doc key and
+            # journal ever written.
+            snapshot_result = publish_state_snapshot(sink, state_path, run_id)
+            log.info("state snapshot: %s", snapshot_result)
     finally:
         lock.release()
 

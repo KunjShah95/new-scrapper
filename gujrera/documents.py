@@ -279,7 +279,9 @@ def _reuse_row(uid: str, label: str, known: Dict[str, Any], client) -> Dict[str,
 
     A UID is GujRERA's upload identity, so a UID we have already downloaded and
     uploaded cannot have changed. This is what turns a full re-download into a
-    no-op for the ~98% of documents that are stable day to day.
+    no-op for the ~98% of documents that are stable day to day. `sha256` may be
+    empty for rows ingested from the legacy layout — the path key there is
+    proof of bytes in R2, not a reason to fetch them again.
     """
     return {
         "label": label,
@@ -321,7 +323,11 @@ def download_all(
     to_fetch: Dict[str, str] = {}
     for uid, label in seen.items():
         prior = known.get(uid)
-        if prior and prior.get("status") == "ok" and prior.get("sha256") and prior.get("blob_key"):
+        # A UID named ok whose bytes are somewhere in the sink is immutable:
+        # reuse it with zero network, whether that row carries the sha (delta
+        # layout) or only the path-based key the legacy importer recorded.
+        if prior and prior.get("status") == "ok" and \
+                (prior.get("sha256") or prior.get("blob_key")):
             manifest.append(_reuse_row(uid, label, prior, client))
         else:
             to_fetch[uid] = label

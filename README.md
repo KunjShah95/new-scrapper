@@ -218,21 +218,54 @@ Projects are walked **oldest-scraped first**, so if a pass is ever cut short by
 `--max-scrapes` or a reboot, the next one picks up the tail rather than
 re-doing the same head.
 
+### What lives in R2, and where
+
+| Kind | Key | Notes |
+|---|---|---|
+| Legacy documents (pre-delta) | `<R2_PDF_PREFIX>/<project>/files/<file>` | uploaded by `r2_sync.py` and the direct pipeline; imported into state by `--import-legacy` |
+| Content-addressed documents | `<R2_PDF_PREFIX>/blobs/<sha[:2]>/<sha[2:4]>/<sha256>` | what new captures write; identical bytes deduped across projects |
+| Per-project records | `<R2_JSON_PREFIX>/projects/<pid>/raw.json.gz`, `summary.json`, `report.md`, `documents_manifest.json` | rewritten whenever the project changes |
+| Change journals | `<R2_JSON_PREFIX>/changes/<date>.jsonl.gz`, `<date>-run<N>.md`/`.json` | the "what moved today" record |
+| Catalogues | `<R2_JSON_PREFIX>/catalogue/projects.json`, `documents.jsonl.gz` | rewritten every run; join key is `pid` + `uid` + `sha256` |
+| State snapshots | `<R2_JSON_PREFIX>/state/<date>/run-<id>.db.gz` + `state/latest.db.gz`, `latest.json` | the SQLite system of record itself |
+
+The state snapshot is the one that matters most: every row above is *derived*
+from `state/gujrera.db`, and a dead VPS drive cannot be reconstructed. The
+snapshot is a real SQLite file (`VACUUM INTO` against the live WAL, so it is
+transactionally consistent even mid-write):
+
+```bash
+curl -fsSL "<R2_PUBLIC_BASE>/scraper/json/gujrera/state/latest.db.gz" -o s.gz
+gunzip s.gz && sqlite3 s ".tables"
+```
+
+A run whose sink is local writes the same keys under `r2_mirror/`;
+`--sync-mirror` republishes whatever it finds there through the R2 sink with
+identical routing, so switching a box between sinks strands nothing:
+
+```bash
+python run.py --sync-mirror            # real (takes the run lock)
+python run.py --sync-mirror --dry-run  # routes only, no network
+```
+
+Idempotent by key: a repeat run finds 282/282 already present and pushes 0.
+
 ### Cost, measured
 
-One project averages ~110 MB of documents (measured across the first captures:
-390 MB for 4 projects, 138 unique blobs from 154 references). So the full estate
-lands near **350–400 GB** in R2:
+The estate was measured where the bytes already live: **~160 GB across 85,881
+documents** (the three 20-projects sample extrapolation of 390 GB assumed
+every legacy project would re-download at full size; the imported manifests
+say otherwise). So the steady-state bill is smaller than first estimated:
 
 | Item | Cost |
 |---|---|
-| Storage (~390 GB) | ~$5.90 / month |
-| Backfill uploads (~140k objects, one-off) | ~$0.65 |
-| Weekly new documents | effectively zero |
+| Storage (~160 GB) | ~$2.40 / month |
+| Mirror/journal/snapshot uploads | pennies (small objects, few dozen per week) |
+| Weekly new documents | effectively zero (UID reuse) |
 | Egress | free |
 
 That is why `--prune-uploaded` matters: R2 is the store, the VPS is staging.
-Keeping 390 GB on a 40 GB VPS is not an option.
+Keeping 160 GB on a 40 GB VPS is not an option.
 
 Credentials come from `.env` (see `deploy/env.example`): `R2_ACCOUNT_ID`,
 `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, `R2_PUBLIC_BASE`.
