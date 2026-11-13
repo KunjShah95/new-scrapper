@@ -195,7 +195,7 @@ def main() -> int:
     if not (args.missing or args.mark_empty or args.gaps):
         parser.error("choose --missing, --mark-empty, --gaps or --all")
 
-    client = GujreraClient()
+    client = GujreraClient(pool_maxsize=max(32, args.max_concurrent))
     stats = {"refetched": 0, "still_empty": 0, "failed": 0, "marked": 0, "bytes": 0}
 
     gap_stats = None
