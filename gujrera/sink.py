@@ -108,6 +108,10 @@ class Sink:
     def exists(self, key: str) -> bool:
         raise NotImplementedError
 
+    def get_bytes(self, key: str) -> Optional[bytes]:
+        """The object's bytes, or None when it does not exist."""
+        raise NotImplementedError
+
     def url_for(self, key: str) -> Optional[str]:
         return f"{self.public_base.rstrip('/')}/{key}" if self.public_base else None
 
@@ -141,6 +145,10 @@ class LocalSink(Sink):
 
     def exists(self, key: str) -> bool:
         return (self.root / key).exists()
+
+    def get_bytes(self, key: str) -> Optional[bytes]:
+        path = self.root / key
+        return path.read_bytes() if path.exists() else None
 
     def url_for(self, key: str) -> Optional[str]:
         if self.public_base:
@@ -275,6 +283,17 @@ class R2Sink(Sink):
             if exc.response.get("Error", {}).get("Code") in ("404", "NoSuchKey", "NotFound"):
                 return False
             raise
+
+    def get_bytes(self, key: str) -> Optional[bytes]:
+        from botocore.exceptions import ClientError
+
+        try:
+            obj = self.client.get_object(Bucket=self.bucket, Key=self._route(key))
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") in ("404", "NoSuchKey", "NotFound"):
+                return None
+            raise
+        return obj["Body"].read()
 
     def head(self, key: str) -> Optional[Dict[str, Any]]:
         from botocore.exceptions import ClientError

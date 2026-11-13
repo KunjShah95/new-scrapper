@@ -14,6 +14,9 @@ Environment=PYTHONUNBUFFERED=1
 
 # Backfill skips the probe entirely and only touches projects that have never
 # been captured, so it needs no change detection and no discovery each slice.
+# No-op when state/gujrera.db exists. On a fresh box it pulls the last
+# snapshot from R2 so ~2,000 captured projects are not re-downloaded.
+ExecStartPre=@@APP_DIR@@/.venv/bin/python run.py --restore-state
 ExecStart=@@APP_DIR@@/.venv/bin/python run.py --daily --backfill --max-scrapes 250 --prune-uploaded
 TimeoutStartSec=8h
 Nice=10

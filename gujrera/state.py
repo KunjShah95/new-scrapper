@@ -239,8 +239,9 @@ class State:
                     ptype        = COALESCE(excluded.ptype, projects.ptype),
                     cost         = COALESCE(excluded.cost, projects.cost),
                     end_date     = COALESCE(excluded.end_date, projects.end_date),
-                    status       = CASE WHEN projects.status='gone' THEN 'active'
-                                        ELSE projects.status END,
+                    -- Seen in discovery again means listed on the portal again.
+                    status       = CASE WHEN projects.status IN ('gone','completed')
+                                        THEN 'active' ELSE projects.status END,
                     last_seen_at = excluded.last_seen_at,
                     last_run_id  = COALESCE(excluded.last_run_id, projects.last_run_id)
                 """,

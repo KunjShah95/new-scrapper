@@ -20,6 +20,9 @@ Environment=PYTHONUNBUFFERED=1
 #
 # --max-scrapes is a runaway guard, not a budget: it sits above the current
 # estate (~2,156) so a normal week covers everything.
+# No-op when state/gujrera.db exists. On a fresh box it pulls the last
+# snapshot from R2 so ~2,000 captured projects are not re-downloaded.
+ExecStartPre=@@APP_DIR@@/.venv/bin/python run.py --restore-state
 ExecStart=@@APP_DIR@@/.venv/bin/python run.py --daily --reverify --max-scrapes 5000 --prune-uploaded
 TimeoutStartSec=12h
 Nice=10

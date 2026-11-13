@@ -24,6 +24,7 @@ import json
 import logging
 import re
 import threading
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -31,6 +32,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from . import r2_direct
 from .api import SCAN_PREFIX
+from .politeness import PortalRefused, Throttle
 
 log = logging.getLogger("gujrera.docs")
 
@@ -284,7 +286,7 @@ def extension_for(content_type: str, filename: str) -> str:
 
 
 def _download_one(client, out_dir: Path, skip_existing: bool, lock: threading.Lock,
-                   uid: str, label: str) -> Dict[str, Any]:
+                   uid: str, label: str, throttle: Optional[Throttle] = None) -> Dict[str, Any]:
     row: Dict[str, Any] = {
         "label": label,
         "uid": uid,
@@ -295,9 +297,13 @@ def _download_one(client, out_dir: Path, skip_existing: bool, lock: threading.Lo
         "content_type": "",
         "status": "",
     }
+    # Streamed to a unique temp name first: scanned filings reach several
+    # hundred MB, so a document is never held in memory whole.
+    part = out_dir / f".{hashlib.sha1(uid.encode('utf-8')).hexdigest()}.part"
     try:
-        content, content_type, raw_name = client.get_document(uid)
-        if not content:
+        with throttle.slot() if throttle else nullcontext():
+            size, sha256, content_type, raw_name = client.stream_document(uid, part)
+        if not size:
             # The portal answers HTTP 200 with an empty body for some UIDs.
             # Writing that as a 0-byte "ok" file hides a missing document, so
             # record it as a failure instead and let the next run retry it.
@@ -308,26 +314,35 @@ def _download_one(client, out_dir: Path, skip_existing: bool, lock: threading.Lo
         with lock:  # filesystem collision check must be atomic across worker threads
             target = out_dir / filename
             counter = 1
-            while target.exists() and target.stat().st_size != len(content):
+            while target.exists() and target.stat().st_size != size:
                 target = out_dir / f"{nice} ({counter}).{ext}"
                 counter += 1
-            if not (skip_existing and target.exists()):
-                target.write_bytes(content)
-                # With direct-to-R2 on, the document is sent to the bucket now and
-                # removed from disk, so a long crawl never fills the laptop.
-                r2_key = r2_direct.offload(target)
-                if r2_key:
-                    row["r2_key"] = r2_key
-                    row["storage"] = "r2"
+            fresh = not (skip_existing and target.exists())
+            if fresh:
+                part.replace(target)
+        if fresh:
+            # With direct-to-R2 on, the document is sent to the bucket now and
+            # removed from disk, so a long crawl never fills the laptop. This runs
+            # outside the lock so one large upload does not stall every worker.
+            r2_key = r2_direct.offload(target)
+            if r2_key:
+                row["r2_key"] = r2_key
+                row["storage"] = "r2"
         row.update(
             file=str(target.name),
-            bytes=len(content),
-            sha256=hashlib.sha256(content).hexdigest(),
+            bytes=size,
+            sha256=sha256,
             content_type=content_type.split(";")[0],
             status="ok",
         )
+    except PortalRefused:
+        raise
     except Exception as exc:  # noqa: BLE001 - a dead link must not kill the run
         row["status"] = f"failed: {exc}"
+    finally:
+        part.unlink(missing_ok=True)
+    if throttle:
+        throttle.record(row["status"])
     return row
 
 
@@ -361,11 +376,13 @@ def download_all(
     skip_existing: bool = True,
     max_workers: int = 8,
     known: Optional[Dict[str, Dict[str, Any]]] = None,
+    throttle: Optional[Throttle] = None,
 ) -> List[Dict[str, Any]]:
     """Download every unique UID, in parallel. Returns the manifest rows.
 
     `known` maps uid -> a previously recorded document row. Any UID present with
     a successful status and a sha256 is reused as-is: no request, no bytes.
+    `throttle`, when given, is shared across calls to cap and pace the portal.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     seen = label_index(uid_pairs)
@@ -399,7 +416,7 @@ def download_all(
 
     with ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
         futures = {
-            pool.submit(_download_one, client, out_dir, skip_existing, lock, uid, label): label
+            pool.submit(_download_one, client, out_dir, skip_existing, lock, uid, label, throttle): label
             for uid, label in to_fetch.items()
         }
         for index, future in enumerate(as_completed(futures), start=1):

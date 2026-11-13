@@ -128,6 +128,8 @@ def cmd_daily(args: argparse.Namespace, districts: list[str]) -> None:
             limit=args.limit, max_scrapes=args.max_scrapes, dry_run=args.dry_run,
             prune_local=args.prune_uploaded, force_all=args.force_all,
             backfill_only=args.backfill, only_pids=only_pids, reverify=args.reverify,
+            full_discovery=not args.keyword_discovery,
+            max_concurrent_docs=args.max_concurrent_docs,
         )
     except LockHeld as exc:
         sys.exit(f"\nrefusing to start — {exc}\n")
@@ -535,6 +537,19 @@ def main() -> None:
                               "all endpoints (oldest-scraped first), so documents added to tabs the "
                               "probe does not watch are still caught. Documents already held are "
                               "reused by UID, so this costs JSON only")
+    parser.add_argument("--keyword-discovery", action="store_true",
+                        help="--daily: old ongoing-only keyword discovery instead of the "
+                             "full registration-number register")
+    parser.add_argument("--max-concurrent-docs", type=int,
+                        default=int(os.environ.get("GUJRERA_MAX_CONCURRENT_DOCS") or 16),
+                        help="--daily: hard cap on document downloads in flight across all "
+                             "projects (default: %(default)s)")
+    parser.add_argument("--restore-state", action="store_true",
+                        help="fetch state/latest.db.gz from R2 when no local state exists "
+                             "(VPS bootstrap; add --force-restore to replace a local db)")
+    parser.add_argument("--force-restore", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--publish-state", action="store_true",
+                        help="snapshot the local state db to R2 now (machine hand-off)")
     parser.add_argument("--runs", action="store_true", help="show recent run history")
     parser.add_argument("--coverage", action="store_true",
                          help="how much of the estate is captured, and how complete it is")
@@ -605,6 +620,17 @@ def main() -> None:
 
     if args.proxy_test:
         cmd_proxy_test(args.proxy)
+        return
+
+    if args.restore_state or args.publish_state:
+        from gujrera.snapshot import publish_state_snapshot, restore_state_snapshot
+        sink = make_sink(args.sink, root=args.sink_root, public_base=args.public_base)
+        if args.restore_state:
+            print(restore_state_snapshot(sink, args.state, force=args.force_restore))
+        else:
+            from gujrera.state import State
+            last = (State(args.state).recent_runs(1) or [{}])[0].get("id", 0)
+            print(publish_state_snapshot(sink, args.state, int(last or 0)))
         return
 
     if args.list_output:

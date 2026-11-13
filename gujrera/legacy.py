@@ -253,7 +253,10 @@ def import_legacy(state: State, output_root: Path, pdf_prefix: str = "",
         if captured:
             state.backdate(pid, captured)
 
-        if hash_raw and found["hashes"]:
+        # A folder with JSON but no documents was a --no-files capture. Leave it
+        # without hashes so the backfill treats it as never captured and fetches
+        # the documents; JSON is cheap to re-read, documents are the point.
+        if hash_raw and found["hashes"] and found["documents"]:
             # Never overwrite hashes the delta engine recorded from a live
             # response: the on-disk copy is exactly as old as the scrape, and a
             # live probe may already have moved past it.

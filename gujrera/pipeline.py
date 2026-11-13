@@ -152,21 +152,25 @@ def discover_projects(client: GujreraClient, queries: Optional[List[str]] = None
         end = _parse_end_date(item.get("pdate"))
         if only_ongoing and (end is None or end <= today):
             continue
-        projects.append(
-            {
-                "pid": int(item["entityId"]),
-                "name": (item.get("entityName") or "").strip(),
-                "regNo": item.get("regNo"),
-                "type": item.get("ptype"),
-                "taluka": item.get("taluka"),
-                "district": item.get("distName"),
-                "address": item.get("address"),
-                "cost": item.get("maxcost"),
-                "endDate": end.isoformat() if end else None,
-            }
-        )
+        projects.append(project_from_search(item))
     projects.sort(key=lambda p: -(p.get("cost") or 0))
     return projects
+
+
+def project_from_search(item: Dict[str, Any]) -> Dict[str, Any]:
+    """A global-search row as the project dict the delta engine stores."""
+    end = _parse_end_date(item.get("pdate"))
+    return {
+        "pid": int(item["entityId"]),
+        "name": (item.get("entityName") or "").strip(),
+        "regNo": item.get("regNo"),
+        "type": item.get("ptype"),
+        "taluka": item.get("taluka"),
+        "district": item.get("distName"),
+        "address": item.get("address"),
+        "cost": item.get("maxcost"),
+        "endDate": end.isoformat() if end else None,
+    }
 
 
 def _parse_end_date(pdate: Optional[str]) -> Optional[_dt.date]:
@@ -203,6 +207,7 @@ def scrape_project(client: GujreraClient, target: Dict[str, Any], output_root: P
                    download_files: bool = True, endpoint_workers: int = 8,
                    doc_workers: int = 8,
                    known_documents: Optional[Dict[str, Dict[str, Any]]] = None,
+                   throttle: Any = None,
                    ) -> Dict[str, Any]:
     pid = int(target["pid"])
     log.info("=" * 78)
@@ -316,7 +321,8 @@ def scrape_project(client: GujreraClient, target: Dict[str, Any], output_root: P
     documents: List[Dict[str, Any]] = []
     if download_files:
         documents = download_all(client, uid_pairs, project_folder / "files",
-                                 max_workers=doc_workers, known=known_documents)
+                                 max_workers=doc_workers, known=known_documents,
+                                 throttle=throttle)
     write_manifest(documents, project_folder / "documents_manifest.json")
 
     # ------------------------------------------------------------------------- bundle ---

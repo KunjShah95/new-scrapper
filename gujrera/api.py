@@ -20,9 +20,11 @@ says so once, instead of failing every request.
 from __future__ import annotations
 
 import base64
+import hashlib
 import logging
 import os
 import time
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -278,32 +280,68 @@ class GujreraClient:
             )
         return self.url("download", uid=ref)
 
-    def get_document(self, uid: str) -> Tuple[Optional[bytes], str, str]:
-        """Download a document by its VDMS UID or `scan:` ref.
-
-        Returns (bytes, content_type, filename).
-        """
+    def _open_document(self, uid: str) -> requests.Response:
+        """GET a document (streamed). Raises unless the portal answered 200."""
         url = self.document_url(uid)
         attempts = 2 if uid.startswith(SCAN_PREFIX) else 1
         for attempt in range(1, attempts + 1):
             try:
-                resp = self.session.get(url, timeout=self.timeout, allow_redirects=True)
+                resp = self.session.get(url, timeout=self.timeout, allow_redirects=True, stream=True)
             except requests.exceptions.ProxyError as exc:
                 self.disable_proxy(self._proxy_error_reason(exc))
-                resp = self.session.get(url, timeout=self.timeout, allow_redirects=True)
+                resp = self.session.get(url, timeout=self.timeout, allow_redirects=True, stream=True)
             time.sleep(self.delay)
-            if resp.status_code == 500 and "No such file or directory" in resp.text[:500]:
+            if resp.status_code == 200:
+                return resp
+            body = resp.text[:500]
+            resp.close()
+            if resp.status_code == 500 and "No such file or directory" in body:
                 raise RuntimeError("missing on portal (HTTP 500: No such file or directory)")
-            if resp.status_code == 200 or attempt == attempts:
-                break
-            time.sleep(1.5 * attempt)
-        if resp.status_code != 200:
-            raise RuntimeError(f"HTTP {resp.status_code}")
-        filename = ""
+            if attempt < attempts:
+                time.sleep(1.5 * attempt)
+        raise RuntimeError(f"HTTP {resp.status_code}")
+
+    @staticmethod
+    def _filename(resp: requests.Response) -> str:
         disposition = resp.headers.get("Content-Disposition") or ""
         if "filename=" in disposition:
-            filename = disposition.split("filename=", 1)[1].strip().strip('"')
-        return resp.content, resp.headers.get("Content-Type", ""), filename
+            return disposition.split("filename=", 1)[1].strip().strip('"')
+        return ""
+
+    def get_document(self, uid: str) -> Tuple[Optional[bytes], str, str]:
+        """Download a document by its VDMS UID or `scan:` ref into memory.
+
+        Returns (bytes, content_type, filename).
+        """
+        with self._open_document(uid) as resp:
+            return resp.content, resp.headers.get("Content-Type", ""), self._filename(resp)
+
+    def stream_document(self, uid: str, dest: Path, chunk: int = 1 << 20) -> Tuple[int, str, str, str]:
+        """Stream a document to `dest` without holding it in memory.
+
+        Scanned filings run to several hundred MB, so they must never be read
+        whole. Returns (bytes, sha256, content_type, filename); `dest` is removed
+        if the transfer fails part way.
+        """
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            with self._open_document(uid) as resp, dest.open("wb") as handle:
+                for block in resp.iter_content(chunk):
+                    handle.write(block)
+                    digest.update(block)
+                    size += len(block)
+                # Content-Length counts bytes on the wire. When the portal gzips a
+                # response, iter_content hands back the decoded (larger) body, so
+                # compare what urllib3 actually read, not what we wrote.
+                expected = resp.headers.get("Content-Length")
+                wire = resp.raw.tell() if hasattr(resp.raw, "tell") else size
+                if expected and expected.isdigit() and wire < int(expected):
+                    raise RuntimeError(f"truncated transfer ({wire} of {expected} bytes)")
+                return size, digest.hexdigest(), resp.headers.get("Content-Type", ""), self._filename(resp)
+        except BaseException:
+            dest.unlink(missing_ok=True)
+            raise
 
     def global_search(self, query: str, start_with: int = 0, data_size: int = 10000):
         return self.post_json(

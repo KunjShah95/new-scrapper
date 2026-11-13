@@ -33,14 +33,18 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .api import GujreraClient, payload
+from . import geo
 from .documents import write_manifest
-from .pipeline import BUNDLE_ENDPOINTS, district_codes, discover_projects, scrape_project
+from .pipeline import (BUNDLE_ENDPOINTS, district_codes, discover_projects,
+                       project_from_search, scrape_project)
+from .politeness import PortalRefused, Throttle
 from .report import build_master_markdown
 from .runlock import LockHeld, RunLock
 from .sink import IMMUTABLE, Sink, blob_key
@@ -69,6 +73,10 @@ DISCOVERY_FLOOR = 0.80
 DISCOVERY_FLOOR_MIN = 50
 
 DEFAULT_DISTRICTS = ("ahmedabad", "gandhinagar", "mehsana")
+
+# Past this many projects in one run the combined Markdown report is skipped:
+# it holds every bundle in memory and nobody reads a 5,000-project document.
+MASTER_REPORT_MAX = 50
 
 
 # ---------------------------------------------------------------------------- hashing ---
@@ -187,6 +195,44 @@ def _discover_strict(client: GujreraClient, district: str, codes: set) -> List[D
             log.warning("discovery attempt %d for '%s' failed: %s", attempt, district, exc)
             time.sleep(5 * attempt)
     raise RuntimeError(f"discovery for '{district}' failed twice: {last}")
+
+
+def _discover_full(client: GujreraClient, districts: Sequence[str]
+                   ) -> Dict[str, List[Dict[str, Any]]]:
+    """Every registered project per district, whatever its stage.
+
+    The keyword search behind `discover_projects` only reaches projects whose
+    name matches one of ten words, and only ongoing ones: ~30% of what the
+    portal lists. The geo sweep enumerates by registration-number head instead
+    (`PR/GJ/AHMEDABAD/...`), then widens with keyword and area sweeps, so it is
+    the complete register. Strict: any failed search fails discovery.
+    """
+    keys = [d.strip().lower() for d in districts]
+    last: Optional[Exception] = None
+    for attempt in (1, 2):
+        try:
+            found, provenance = geo.discover(client, keys, strict=True)
+            break
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            log.warning("full discovery attempt %d failed: %s", attempt, exc)
+            time.sleep(15 * attempt)
+    else:
+        raise RuntimeError(f"full discovery failed twice: {last}")
+
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for key in keys:
+        label = geo.DISTRICTS[key]["label"]
+        projects = []
+        for row in found.get(key, {}).values():
+            project = project_from_search(row)
+            # Filed by the portal's own district code, so label it that way.
+            project["district"] = label
+            project["discoverySource"] = provenance.get(key, {}).get(str(project["pid"]))
+            projects.append(project)
+        projects.sort(key=lambda p: -(p.get("cost") or 0))
+        out[key] = projects
+    return out
 
 
 def load_previous_payloads(folder_root: Path, pid: int,
@@ -546,6 +592,8 @@ def run_delta(output_root: Path, state_path: Path, sink: Sink,
               force_all: bool = False, backfill_only: bool = False,
               only_pids: Optional[Sequence[int]] = None,
               reverify: bool = False,
+              full_discovery: bool = True,
+              max_concurrent_docs: int = 16,
               lock_path: Optional[Path] = None) -> Dict[str, Any]:
     """One incremental pass: discover, probe, scrape only what moved, journal it."""
     started = time.monotonic()
@@ -592,10 +640,18 @@ def run_delta(output_root: Path, state_path: Path, sink: Sink,
                 to_scrape.append({"pid": int(pid)})
             districts = tuple(districts)
 
+        register: Dict[str, List[Dict[str, Any]]] = {}
+        if full_discovery and not only_pids:
+            log.info("### full register discovery: %s ###", ", ".join(districts))
+            register = _discover_full(client, districts)
+
         for district in (() if only_pids else districts):
             codes = district_codes(district)
-            log.info("### %s — discovering ###", district)
-            found = _discover_strict(client, district, codes)
+            if full_discovery:
+                found = list(register.get(district.strip().lower(), []))
+            else:
+                log.info("### %s — discovering ###", district)
+                found = _discover_strict(client, district, codes)
             if limit:
                 found = found[:limit]
             counts["discovered"] += len(found)
@@ -714,8 +770,20 @@ def run_delta(output_root: Path, state_path: Path, sink: Sink,
                  " [dry run]" if dry_run else "")
 
         # -- 3. scrape what moved ---------------------------------------------
-        for index, target in enumerate(to_scrape, start=1):
+        # Projects run `project_workers` at a time. Each one is independent: its
+        # own folder, its own state rows (State serialises writes), its own sink
+        # keys. One Throttle is shared by every document download in the run so
+        # the total in flight against the portal stays capped however many
+        # projects overlap, and a run of 403/429s stops the run instead of
+        # pressing on.
+        throttle = Throttle(max_concurrent=max_concurrent_docs)
+        counts_lock = threading.Lock()
+        refused: List[str] = []
+
+        def scrape_one(index: int, target: Dict[str, Any]) -> None:
             pid = int(target["pid"])
+            if refused:
+                return
             row = state.get_project(pid) or {}
             district = (row.get("district") or "Ahmedabad").strip().upper().replace(" ", "_")
             folder_root = output_root / district
@@ -724,25 +792,24 @@ def run_delta(output_root: Path, state_path: Path, sink: Sink,
             resolved = {**target, "name": row.get("name"), "regNo": row.get("reg_no")}
             previous = load_previous_payloads(folder_root, pid, prior_hashes)
 
-            if dry_run:
-                log.info("[%d/%d] would scrape %s (%s)", index, len(to_scrape), pid,
-                         row.get("name") or "?")
-                continue
-
             log.info("[%d/%d] scraping %s (%s)", index, len(to_scrape), pid,
                      row.get("name") or "?")
             try:
                 bundle = scrape_project(
                     client, resolved, folder_root, download_files=download_files,
                     endpoint_workers=endpoint_workers, doc_workers=doc_workers,
-                    known_documents=prior_docs,
+                    known_documents=prior_docs, throttle=throttle,
                 )
+            except PortalRefused as exc:
+                refused.append(str(exc))
+                return
             except Exception as exc:  # noqa: BLE001 - one project must not stop the run
                 log.exception("project %s failed: %s", pid, exc)
                 state.add_change(run_id, pid, "scrape_failed", row.get("name"),
                                  {"error": str(exc)})
-                failed_pids.append(pid)
-                continue
+                with counts_lock:
+                    failed_pids.append(pid)
+                return
 
             current_hashes = endpoint_hashes(bundle.get("raw") or {})
             for endpoint, (digest, _size) in current_hashes.items():
@@ -752,11 +819,24 @@ def run_delta(output_root: Path, state_path: Path, sink: Sink,
                 diffs = diff_payloads(payload(previous.get(endpoint)),
                                       payload(bundle["raw"].get(endpoint)))
                 state.add_change(run_id, pid, "field_changed", endpoint, diffs)
+
+            documents = bundle.get("documents") or []
+            folder = folder_root / bundle["folder"]
+            # Bytes first, then the record that says we hold them: a project is
+            # only marked scraped once its blobs are in the sink.
+            try:
+                stats = uploader.push(pid, bundle, folder, documents)
+            except Exception as exc:  # noqa: BLE001 - not marked scraped; retried next run
+                log.exception("upload failed for %s: %s", pid, exc)
+                state.add_change(run_id, pid, "scrape_failed", row.get("name"),
+                                 {"error": f"upload: {exc}"})
+                with counts_lock:
+                    failed_pids.append(pid)
+                return
+
             state.set_endpoint_hashes(pid, current_hashes)
             state.mark_scraped(pid, run_id)
             state.set_summary(pid, bundle.get("summary"))
-
-            documents = bundle.get("documents") or []
             if download_files:
                 state.add_changes(_document_changes(pid, prior_docs, documents), run_id)
                 current_uids = {d["uid"] for d in documents}
@@ -764,30 +844,54 @@ def run_delta(output_root: Path, state_path: Path, sink: Sink,
                     pid, [uid for uid in prior_docs if uid not in current_uids]
                 )
 
-            folder = folder_root / bundle["folder"]
-            stats = uploader.push(pid, bundle, folder, documents)
-            counts["bytes_downloaded"] += stats["bytes"]
-
+            new_docs = reused_docs = failed_docs = 0
             for doc in documents:
                 if doc.get("status") == "ok":
                     if doc["uid"] in prior_docs:
-                        counts["docs_reused"] += 1
+                        reused_docs += 1
                     else:
-                        counts["docs_new"] += 1
+                        new_docs += 1
                         state.record_version(pid, doc.get("label") or "", doc["uid"],
                                              doc.get("sha256"))
                 else:
-                    counts["docs_failed"] += 1
+                    failed_docs += 1
                     state.add_change(run_id, pid, "document_failed", doc.get("label"),
                                      {"uid": doc["uid"], "error": doc.get("status")})
                 state.upsert_document(pid, doc, uploaded=bool(doc.get("blob_key")))
 
             write_manifest(documents, folder / "documents_manifest.json")
-            scraped_bundles.append(bundle)
-            counts["changed_projects"] += 1
-            # Persist progress per project: a killed run must still report what
-            # it actually captured.
-            state.update_run(run_id, **counts)
+            with counts_lock:
+                counts["bytes_downloaded"] += stats["bytes"]
+                counts["docs_new"] += new_docs
+                counts["docs_reused"] += reused_docs
+                counts["docs_failed"] += failed_docs
+                counts["changed_projects"] += 1
+                index_rows.append({"folder": bundle["folder"],
+                                   "markdown": bundle["markdown_name"],
+                                   "summary": bundle["summary"]})
+                if len(to_scrape) <= MASTER_REPORT_MAX:
+                    scraped_bundles.append(bundle)
+                # Persist progress per project: a killed run must still report
+                # what it actually captured.
+                state.update_run(run_id, **counts)
+
+        index_rows: List[Dict[str, Any]] = []
+        if dry_run:
+            for index, target in enumerate(to_scrape, start=1):
+                row = state.get_project(int(target["pid"])) or {}
+                log.info("[%d/%d] would scrape %s (%s)", index, len(to_scrape),
+                         target["pid"], row.get("name") or "?")
+        elif to_scrape:
+            with ThreadPoolExecutor(max_workers=max(1, project_workers)) as pool:
+                futures = [pool.submit(scrape_one, index, target)
+                           for index, target in enumerate(to_scrape, start=1)]
+                for future in as_completed(futures):
+                    future.result()
+                    if refused:
+                        for pending_future in futures:
+                            pending_future.cancel()
+        if refused:
+            raise RuntimeError(f"stopped: {refused[0]}. Progress is saved; re-run later.")
 
         # -- 4. lifecycle journal ---------------------------------------------
         for pid in completed_pids:
@@ -799,12 +903,9 @@ def run_delta(output_root: Path, state_path: Path, sink: Sink,
         if scraped_bundles:
             master = output_root / "AHMEDABAD_10_PROJECTS_REPORT.md"
             master.write_text(build_master_markdown(scraped_bundles), encoding="utf-8")
+        if index_rows:
             (output_root / "index.json").write_text(
-                json.dumps(
-                    [{"folder": b["folder"], "markdown": b["markdown_name"],
-                      "summary": b["summary"]} for b in scraped_bundles],
-                    indent=2, ensure_ascii=False, default=str,
-                ),
+                json.dumps(index_rows, indent=2, ensure_ascii=False, default=str),
                 encoding="utf-8",
             )
 

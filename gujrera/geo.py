@@ -377,22 +377,30 @@ GENERIC_QUERIES = [
 ]
 
 
-def _search(client: GujreraClient, query: str) -> List[Dict[str, Any]]:
+def _search_one(client: GujreraClient, query: str, strict: bool = False) -> List[Dict[str, Any]]:
     data, error = client.global_search(query, data_size=10000)
     if error:
         log.warning("  search %-26r failed: %s", query, error)
+        if strict:
+            raise RuntimeError(f"search {query!r} failed: {error}")
         return []
     rows = (data or {}).get("data") or []
     return [row for row in rows if isinstance(row, dict) and row.get("entityType") == "PROJECT"]
 
 
-def discover(client: GujreraClient, districts: List[str]
+def discover(client: GujreraClient, districts: List[str], strict: bool = False
              ) -> Tuple[Dict[str, Dict[int, Dict[str, Any]]], Dict[str, Dict[str, str]]]:
     """Every project in each district, with the provenance of each pid recorded.
 
     Returns {district_key: {pid: row}} plus a report of how many projects each sweep
     contributed, so completeness is measurable rather than assumed.
+
+    `strict` raises on any failed search instead of skipping it: the delta engine
+    reads a missing pid as "withdrawn", so a partial sweep must never pass as whole.
     """
+    def _search(c: GujreraClient, query: str) -> List[Dict[str, Any]]:
+        return _search_one(c, query, strict)
+
     found: Dict[str, Dict[int, Dict[str, Any]]] = {key: {} for key in districts}
     provenance: Dict[str, Dict[str, str]] = {key: {} for key in districts}
 

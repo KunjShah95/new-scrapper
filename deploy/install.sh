@@ -121,8 +121,11 @@ if [ "${NEEDS_EDIT:-0}" = "1" ]; then
 $(printf '\033[33m')ACTION REQUIRED: fill in the R2 credentials before the first run.$(printf '\033[0m')
 
   sudo nano $APP_DIR/.env          # R2_ACCOUNT_ID, R2_ACCESS_KEY_ID/SECRET,
-                                   # R2_BUCKET, R2_PUBLIC_BASE
-  sudo -u $APP_USER $APP_DIR/.venv/bin/python run.py --daily --dry-run
+                                   # R2_BUCKET, R2_PDF_PREFIX, R2_JSON_PREFIX
+  cd $APP_DIR
+  sudo -u $APP_USER .venv/bin/python run.py --restore-state   # pull state from R2
+  sudo -u $APP_USER .venv/bin/python run.py --coverage        # must show ~2,500 projects
+  sudo -u $APP_USER .venv/bin/python run.py --proxy-test
 
 EOF
 fi
@@ -131,7 +134,11 @@ cat <<'EOF'
 Attach the custom domain to the bucket first (R2 → bucket → Settings → Custom
 Domains). `r2.dev` is rate-limited and not intended for production traffic.
 
-First crawl: this is a ~3,000 project backfill, not a single night's work.
+Before the first run, the state db must come from R2 (the systemd units do this
+on their own via ExecStartPre; it is a no-op once state/gujrera.db exists).
+Without it every captured project counts as new and ~190 GB re-downloads.
+
+Remaining crawl: ~4,900 registered projects have never been captured.
 
   sudo systemctl start gujrera-backfill          # one 250-project slice
   sudo ENABLE_BACKFILL=1 ./deploy/install.sh     # …or run slices every 20 min

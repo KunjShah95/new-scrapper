@@ -87,3 +87,43 @@ def publish_state_snapshot(sink: Sink, state_path: Path, run_id: int,
         return {"run": timestamped, "db_mb": round(len(db_bytes) / 1e6, 2)}
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def restore_state_snapshot(sink: Sink, state_path: Path, force: bool = False) -> Dict[str, Any]:
+    """Fetch `state/latest.db.gz` into `state_path` — the VPS bootstrap.
+
+    A fresh machine with no database treats all ~2,000 captured projects as new
+    and re-downloads every document. Restoring the snapshot first makes it carry
+    on exactly where the last machine stopped. Refuses to overwrite an existing
+    database unless `force`, and the old one is kept as `.pre-restore`.
+    """
+    state_path = Path(state_path)
+    if state_path.exists() and not force:
+        return {"skipped": True, "reason": f"{state_path} already exists"}
+    blob = sink.get_bytes("state/latest.db.gz")
+    if blob is None:
+        return {"skipped": True, "reason": "no state/latest.db.gz in the sink"}
+    db_bytes = gzip.decompress(blob)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = state_path.with_suffix(".restore.db")
+    tmp.write_bytes(db_bytes)
+    conn = sqlite3.connect(str(tmp))
+    try:
+        check = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        projects = conn.execute("SELECT count(*) FROM projects").fetchone()[0]
+    finally:
+        conn.close()
+    if check != "ok":
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"restored snapshot failed integrity_check: {check}")
+    if state_path.exists():
+        for suffix in ("-wal", "-shm"):
+            Path(str(state_path) + suffix).unlink(missing_ok=True)
+        state_path.replace(state_path.with_suffix(".db.pre-restore"))
+    tmp.replace(state_path)
+    meta = sink.get_bytes("state/latest.json")
+    info = json.loads(meta) if meta else {}
+    log.info("state restored: %d projects, %.2f MB, from run %s",
+             projects, len(db_bytes) / 1e6, info.get("run_id"))
+    return {"restored": True, "projects": projects, "db_mb": round(len(db_bytes) / 1e6, 2),
+            "run_id": info.get("run_id"), "published_at": info.get("published_at")}
